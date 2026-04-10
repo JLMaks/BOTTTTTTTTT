@@ -1,0 +1,222 @@
+"""
+Base de données — supporte SQLite (dev local) et PostgreSQL (Supabase en prod).
+Détection automatique via la variable DATABASE_URL.
+"""
+
+import os, json, sqlite3
+from datetime import datetime
+
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Supabase / PostgreSQL en prod
+USE_PG = bool(DATABASE_URL)
+
+# ── POSTGRESQL (Supabase) ────────────────────────────────────────
+if USE_PG:
+    import psycopg2
+    import psycopg2.extras
+
+    def get_conn():
+        url = DATABASE_URL
+        # Render / Supabase fournissent parfois postgres:// au lieu de postgresql://
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+        conn.autocommit = True
+        return conn
+
+    def init_db():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS characters (
+                        id          SERIAL PRIMARY KEY,
+                        discord_id  TEXT NOT NULL,
+                        guild_id    TEXT NOT NULL,
+                        name        TEXT NOT NULL,
+                        title       TEXT DEFAULT '',
+                        party       TEXT DEFAULT 'none',
+                        party_name  TEXT DEFAULT '',
+                        region      TEXT DEFAULT '',
+                        age         TEXT DEFAULT '',
+                        bio         TEXT DEFAULT '',
+                        ideology    INTEGER DEFAULT 50,
+                        stats       TEXT DEFAULT '{}',
+                        colors      TEXT DEFAULT '{}',
+                        build       TEXT DEFAULT 'average',
+                        accessory   TEXT DEFAULT 'none',
+                        created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+                        updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        token       TEXT PRIMARY KEY,
+                        discord_id  TEXT NOT NULL,
+                        guild_id    TEXT NOT NULL,
+                        char_id     INTEGER,
+                        created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+    def _exec(query, params=(), fetchone=False, fetchall=False):
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                if fetchone:
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+                if fetchall:
+                    return [dict(r) for r in cur.fetchall()]
+                return cur.rowcount
+
+    def _insert_ret(query, params):
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query + " RETURNING id", params)
+                return cur.fetchone()["id"]
+
+    PLACEHOLDER = "%s"
+
+# ── SQLITE (développement local) ────────────────────────────────
+else:
+    DB_PATH = os.environ.get("DB_PATH", "republic_rp.db")
+
+    def get_conn():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db():
+        with get_conn() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS characters (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discord_id  TEXT NOT NULL,
+                    guild_id    TEXT NOT NULL,
+                    name        TEXT NOT NULL,
+                    title       TEXT DEFAULT '',
+                    party       TEXT DEFAULT 'none',
+                    party_name  TEXT DEFAULT '',
+                    region      TEXT DEFAULT '',
+                    age         TEXT DEFAULT '',
+                    bio         TEXT DEFAULT '',
+                    ideology    INTEGER DEFAULT 50,
+                    stats       TEXT DEFAULT '{}',
+                    colors      TEXT DEFAULT '{}',
+                    build       TEXT DEFAULT 'average',
+                    accessory   TEXT DEFAULT 'none',
+                    created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token       TEXT PRIMARY KEY,
+                    discord_id  TEXT NOT NULL,
+                    guild_id    TEXT NOT NULL,
+                    char_id     INTEGER,
+                    created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+    def _exec(query, params=(), fetchone=False, fetchall=False):
+        # Convert %s → ? for SQLite
+        q = query.replace("%s", "?")
+        with get_conn() as conn:
+            cur = conn.execute(q, params)
+            if fetchone:
+                row = cur.fetchone()
+                return dict(row) if row else None
+            if fetchall:
+                return [dict(r) for r in cur.fetchall()]
+            return cur.lastrowid
+
+    def _insert_ret(query, params):
+        q = query.replace("%s", "?")
+        with get_conn() as conn:
+            cur = conn.execute(q, params)
+            return cur.lastrowid
+
+    PLACEHOLDER = "?"
+
+# ── INIT ─────────────────────────────────────────────────────────
+init_db()
+
+# ── CHARACTERS ───────────────────────────────────────────────────
+
+def upsert_character(discord_id, guild_id, data: dict):
+    existing = get_character_by_user(discord_id, guild_id)
+    s = _ser(data)
+    now = datetime.utcnow().isoformat()
+    if existing:
+        _exec(
+            """UPDATE characters SET name=%s,title=%s,party=%s,party_name=%s,region=%s,
+               age=%s,bio=%s,ideology=%s,stats=%s,colors=%s,build=%s,accessory=%s,updated_at=%s
+               WHERE discord_id=%s AND guild_id=%s""",
+            (s["name"],s["title"],s["party"],s["party_name"],s["region"],
+             s["age"],s["bio"],s["ideology"],s["stats"],s["colors"],s["build"],s["accessory"],
+             now, discord_id, guild_id)
+        )
+        return existing["id"]
+    else:
+        return _insert_ret(
+            """INSERT INTO characters (discord_id,guild_id,name,title,party,party_name,
+               region,age,bio,ideology,stats,colors,build,accessory)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (discord_id,guild_id,s["name"],s["title"],s["party"],s["party_name"],
+             s["region"],s["age"],s["bio"],s["ideology"],s["stats"],s["colors"],s["build"],s["accessory"])
+        )
+
+def get_character_by_user(discord_id, guild_id):
+    row = _exec(
+        "SELECT * FROM characters WHERE discord_id=%s AND guild_id=%s ORDER BY updated_at DESC LIMIT 1",
+        (discord_id, guild_id), fetchone=True
+    )
+    return _des(row)
+
+def get_character_by_id(char_id):
+    row = _exec("SELECT * FROM characters WHERE id=%s", (char_id,), fetchone=True)
+    return _des(row)
+
+def list_characters(guild_id):
+    rows = _exec("SELECT * FROM characters WHERE guild_id=%s ORDER BY updated_at DESC", (guild_id,), fetchall=True)
+    return [_des(r) for r in rows]
+
+def delete_character(discord_id, guild_id):
+    _exec("DELETE FROM characters WHERE discord_id=%s AND guild_id=%s", (discord_id, guild_id))
+
+# ── SESSIONS ─────────────────────────────────────────────────────
+
+def create_session(token, discord_id, guild_id, char_id=None):
+    # Upsert
+    existing = _exec("SELECT token FROM sessions WHERE token=%s", (token,), fetchone=True)
+    if existing:
+        _exec("UPDATE sessions SET discord_id=%s,guild_id=%s,char_id=%s WHERE token=%s",
+              (discord_id, guild_id, char_id, token))
+    else:
+        _exec("INSERT INTO sessions (token,discord_id,guild_id,char_id) VALUES (%s,%s,%s,%s)",
+              (token, discord_id, guild_id, char_id))
+
+def get_session(token):
+    return _exec("SELECT * FROM sessions WHERE token=%s", (token,), fetchone=True)
+
+def delete_session(token):
+    _exec("DELETE FROM sessions WHERE token=%s", (token,))
+
+# ── HELPERS ──────────────────────────────────────────────────────
+
+def _ser(data):
+    d = dict(data)
+    for k in ("stats","colors"):
+        if k in d and isinstance(d[k], (dict,list)):
+            d[k] = json.dumps(d[k])
+    for k in ("name","title","party","party_name","region","age","bio","build","accessory"):
+        d.setdefault(k, "")
+    d.setdefault("ideology", 50)
+    return d
+
+def _des(row):
+    if not row: return None
+    d = dict(row)
+    for k in ("stats","colors"):
+        if k in d and isinstance(d[k], str):
+            try: d[k] = json.loads(d[k])
+            except: d[k] = {}
+    return d
